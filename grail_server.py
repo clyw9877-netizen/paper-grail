@@ -26,6 +26,8 @@ candles: dict[str, list[dict]] = {s: [] for s in SYMBOLS}
 source = "нет данных"
 seen: dict[str, object] = {}
 day_key = time.strftime("%Y-%m-%d", time.gmtime())
+live: dict[str, float] = {}
+updated = "—"
 lock = threading.Lock()
 
 
@@ -45,7 +47,7 @@ def fetch_yahoo(symbol: str, host: str) -> list[dict]:
         if None in (o, h, l, c):
             continue
         out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-    return out[-41:-1]  # последняя 15m свеча ещё формируется — не берём
+    return out[-41:]  # последняя свеча формируется: она идёт в живую цену
 
 
 def fetch_stooq(symbol: str) -> list[dict]:
@@ -98,18 +100,29 @@ def signal(symbol: str) -> dict | None:
 
 
 def refresh() -> None:
-    global source, equity, day_pnl, day_key
+    global source, equity, day_pnl, day_key, updated
     got = {}
     srcs = []
     for s in SYMBOLS:
         try:
             cs, src = fetch(s)
+            if src.startswith("Yahoo") and len(cs) > 1:
+                live[s] = cs[-1]["c"]  # живая цена из формирующейся свечи
+                cs = cs[:-1]  # сделки — только по закрытым свечам
+            elif cs:
+                live[s] = cs[-1]["c"]
             got[s] = cs
             srcs.append(f"{s}: {src}")
         except Exception:  # noqa: BLE001
             srcs.append(f"{s}: источники молчат, лента старая")
     with lock:
         source = " | ".join(srcs)
+        updated = time.strftime("%H:%M:%S UTC", time.gmtime())
+        for s, p in positions.items():  # плавающий PnL каждый цикл
+            if s in live:
+                d = 1 if p["side"] == "long" else -1
+                p["u"] = (live[s] - p["entry"]) / abs(p["entry"] - p["stop"]) * RISK_USD * d
+                p["price"] = live[s]
         today = time.strftime("%Y-%m-%d", time.gmtime())
         if today != day_key:
             day_key, day_pnl = today, 0.0
@@ -149,6 +162,7 @@ def snapshot() -> dict:
             "pnl": round(equity + unreal - START, 2),
             "day_pnl": round(day_pnl, 2),
             "source": source,
+            "updated": updated,
             "open": list(positions.values()),
             "closed": closed[:12],
             "note": "paper only",
@@ -161,7 +175,7 @@ def loop() -> None:
             refresh()
         except Exception as exc:  # noqa: BLE001
             print("refresh error:", exc, flush=True)
-        time.sleep(60)
+        time.sleep(20)
 
 
 PAGE = """<!DOCTYPE html>
@@ -195,9 +209,10 @@ async function refresh(){
   p.className = s.pnl>=0?'up':'down';
   const d = document.getElementById('day');
   d.textContent = (s.day_pnl>=0?'+':'') + s.day_pnl.toFixed(2);
-  document.getElementById('src').textContent = s.source;
+  document.getElementById('src').textContent = s.source + ' · обновлено ' + s.updated;
   document.getElementById('live').innerHTML = s.open.map(x =>
-    `<div class="card"><div class="row"><b class="${x.side=='long'?'up':'down'}">${x.symbol} ${x.side}</b><b>${x.u.toFixed(2)}</b></div>
+    `<div class="card"><div class="row"><b class="${x.side=='long'?'up':'down'}">${x.symbol} ${x.side}</b><b class="${x.u>=0?'up':'down'}">${(x.u>=0?'+':'') + x.u.toFixed(2)}$</b></div>
+     <div class="row"><span>сейчас</span><span>${(x.price ?? x.entry).toFixed(2)}</span></div>
      <div class="row"><span>вход</span><span>${x.entry.toFixed(2)}</span></div>
      <div class="row"><span>стоп</span><span>${x.stop.toFixed(2)}</span></div>
      <div class="row"><span>тейк 1:1</span><span>${x.take.toFixed(2)}</span></div></div>`).join('') || '<div class="card">скип</div>';
