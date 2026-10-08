@@ -1,7 +1,8 @@
 """
 Бумажный грааль: Nasdaq (NQ=F) и золото (GC=F).
 Цены: публичный chart Yahoo, без ключа. Если Yahoo не ответил — фейк и пометка.
-Не брокер. 1 позиция на инструмент, тейк 1:1, риск $10, комиссия $0.70 сторона.
+Не брокер. 1 позиция на инструмент, тейк 1:1, риск $200, стоп не уже 20 пунктов NQ / 4 пункта золота.
+Два стопа и депозит $500 почти мёртв.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 START = 500.0
-RISK_USD = 10.0
-COMMISSION = 0.70
+RISK_USD = 200.0
+COMMISSION = 1.40
+DAILY_STOP = -200.0
 SYMBOLS = ("NQ=F", "GC=F")
 
 equity = START
@@ -82,20 +84,23 @@ def fetch(symbol: str) -> tuple[list[dict], str]:
 
 def signal(symbol: str) -> dict | None:
     cs = candles.get(symbol) or []
-    if len(cs) < 6 or symbol in positions or day_pnl <= -50:
+    if len(cs) < 6 or symbol in positions or day_pnl <= DAILY_STOP:
         return None
     level = round(cs[-4]["c"] / (25 if symbol.startswith("NQ") else 5)) * (25 if symbol.startswith("NQ") else 5)
     br, retest, trigger = cs[-3], cs[-2], cs[-1]
-    if br["c"] > level and retest["l"] <= level + (level * 0.0004) and trigger["c"] > trigger["o"]:
-        risk = trigger["c"] - retest["l"]
-        if risk <= 0:
+    min_risk = 20.0 if symbol.startswith("NQ") else 4.0
+    if br["c"] > level and retest["l"] <= level + (level * 0.0008) and trigger["c"] > trigger["o"]:
+        stop = min(retest["l"], trigger["c"] - min_risk)
+        risk = trigger["c"] - stop
+        if risk < min_risk:
             return None
-        return {"symbol": symbol, "side": "long", "entry": trigger["c"], "stop": retest["l"], "take": trigger["c"] + risk, "u": 0.0}
-    if br["c"] < level and retest["h"] >= level - (level * 0.0004) and trigger["c"] < trigger["o"]:
-        risk = retest["h"] - trigger["c"]
-        if risk <= 0:
+        return {"symbol": symbol, "side": "long", "entry": trigger["c"], "stop": stop, "take": trigger["c"] + risk, "risk_usd": RISK_USD, "u": 0.0}
+    if br["c"] < level and retest["h"] >= level - (level * 0.0008) and trigger["c"] < trigger["o"]:
+        stop = max(retest["h"], trigger["c"] + min_risk)
+        risk = stop - trigger["c"]
+        if risk < min_risk:
             return None
-        return {"symbol": symbol, "side": "short", "entry": trigger["c"], "stop": retest["h"], "take": trigger["c"] - risk, "u": 0.0}
+        return {"symbol": symbol, "side": "short", "entry": trigger["c"], "stop": stop, "take": trigger["c"] - risk, "risk_usd": RISK_USD, "u": 0.0}
     return None
 
 
@@ -190,7 +195,7 @@ main{max-width:760px;margin:0 auto;padding:18px 14px 40px}
 .row{display:flex;justify-content:space-between;margin-top:4px;color:#ccc}
 </style></head><body><main>
 <h1>Paper Graal</h1>
-<p class="muted">Nasdaq NQ=F и золото GC=F. Цены Yahoo, 15 минут. Бумага $500, не брокер.</p>
+<p class="muted">NQ и золото, Yahoo 15m. Бумага $500. Риск $200, тейк 1:1, стоп минимум 20 пунктов NQ. Не брокер.</p>
 <div class="grid">
 <div class="card">депозит<b id="eq">—</b></div>
 <div class="card">pnl<b id="pnl">—</b></div>
