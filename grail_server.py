@@ -1,9 +1,13 @@
 """
-Бумажный грааль: Nasdaq (NQ=F) и золото (GC=F).
-Цены: публичный chart Yahoo, без ключа. Если Yahoo не ответил — фейк и пометка.
-Не брокер. 1 позиция на инструмент. Полка, дырка слева, пробой одной свечой,
-вход лимиткой на тень пробойной, стоп за тень, тейк 1:1, риск $200.
-Два стопа и депозит $500 почти мёртв.
+Бумажный грааль по разбору Мусы. NQ=F и GC=F, Yahoo 15m, без ключа.
+Ордеров нет. Депозит $500, риск $200, тейк строго 1:1, комиссия $1.40.
+
+Уровень: 2-3 свечи, тела не закрылись, фитили в одно место.
+Слева пустота. Проторговка слева — скип.
+Пробой телом, ретест не дальше бокса, вход когда свеча переоделась.
+Свеча без фитиля или с огромным фитилем — скип.
+Стоп за фитиль пробоя. Тейк 1:1. Азию не торгуем.
+Deep Gamma и Big Trades тут нет: их Yahoo не отдаёт.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import os
 import threading
 import time
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 START = 500.0
@@ -50,7 +55,7 @@ def fetch_yahoo(symbol: str, host: str) -> list[dict]:
         if None in (o, h, l, c):
             continue
         out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-    return out[-41:]  # последняя свеча формируется: она идёт в живую цену
+    return out[-121:]  # последняя свеча формируется: она идёт в живую цену
 
 
 def fetch_stooq(symbol: str) -> list[dict]:
@@ -77,47 +82,77 @@ def fetch(symbol: str) -> tuple[list[dict], str]:
             return fetch_yahoo(symbol, host), f"Yahoo {host} 15m"
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
-    try:
-        return fetch_stooq(symbol), "Stooq daily fallback"
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("; ".join(errors + [str(exc)])) from exc
+    raise RuntimeError("; ".join(errors))
 
 
-def signal(symbol: str) -> dict | None:
-    """Полка, дырка слева, пробой одной свечой, вход на её тень, стоп за тенью, тейк 1:1."""
-    cs = candles.get(symbol) or []
-    if len(cs) < 12 or symbol in positions or day_pnl <= DAILY_STOP:
+def session_ok(ts: int) -> bool:
+    hour = datetime.fromtimestamp(ts, timezone.utc).hour
+    # Лондон и Нью-Йорк по UTC. Азия, примерно 0-7 UTC, скип.
+    return 7 <= hour < 21
+
+
+def wick_ok(c: dict) -> bool:
+    body = abs(c["c"] - c["o"])
+    rng = c["h"] - c["l"]
+    if rng <= 0 or body <= 0:
+        return False
+    upper = c["h"] - max(c["o"], c["c"])
+    lower = min(c["o"], c["c"]) - c["l"]
+    if upper < rng * 0.05 and lower < rng * 0.05:
+        return False
+    if upper > body * 1.5 or lower > body * 1.5:
+        return False
+    return True
+
+
+def setup(cs: list[dict]) -> dict | None:
+    if len(cs) < 15 or not session_ok(cs[-1]["t"]):
         return None
-    br = cs[-2]
-    cur = cs[-1]
-    shelf = cs[-8:-2]
-    gap = cs[-12:-8]
-    body = abs(br["c"] - br["o"])
-    wick_up = br["h"] - max(br["o"], br["c"])
-    wick_dn = min(br["o"], br["c"]) - br["l"]
-    if body <= 0:
+    box = cs[-6:-3]
+    left = cs[-14:-6]
+    br, retest, cur = cs[-3], cs[-2], cs[-1]
+    if not wick_ok(br):
         return None
-    # шорт: полка сверху, дырка ниже полки, пробой вниз, тень не длиннее тела
-    level = min(c["l"] for c in shelf)
-    hole = max(c["h"] for c in gap) < level
-    if br["c"] < level and br["o"] >= level and wick_up <= body and hole:
+    top = max(c["h"] for c in box)
+    bot = min(c["l"] for c in box)
+    if top <= bot:
+        return None
+    poked = sum(1 for c in box if c["h"] >= top - (top - bot) * 0.25 or c["l"] <= bot + (top - bot) * 0.25)
+    bodies_inside = all(min(c["o"], c["c"]) >= bot and max(c["o"], c["c"]) <= top for c in box)
+    if poked < 2 or not bodies_inside:
+        return None
+    # слева пустота, не проторговка
+    if min(c["l"] for c in left) > bot and max(c["h"] for c in left) < top:
+        return None
+    impulse = abs(br["c"] - br["o"]) > (top - bot) * 2
+    if impulse:
+        return None
+    # шорт: тело закрылось под боксом, ретест не выше бокса, свеча переоделась вниз
+    if br["c"] < bot and br["o"] >= bot and retest["h"] <= top and retest["l"] <= bot and cur["c"] < cur["o"] and cur["c"] < retest["c"]:
         entry = max(br["o"], br["c"])
         stop = br["h"]
         risk = stop - entry
         if risk <= 0 or cur["h"] < entry:
             return None
-        return {"symbol": symbol, "side": "short", "entry": entry, "stop": stop, "take": entry - risk, "u": 0.0}
-    # лонг: полка снизу, дырка выше, пробой вверх
-    level = max(c["h"] for c in shelf)
-    hole = min(c["l"] for c in gap) > level
-    if br["c"] > level and br["o"] <= level and wick_dn <= body and hole:
+        return {"side": "short", "entry": entry, "stop": stop, "take": entry - risk, "u": 0.0}
+    # лонг
+    if br["c"] > top and br["o"] <= top and retest["l"] >= bot and retest["h"] >= top and cur["c"] > cur["o"] and cur["c"] > retest["c"]:
         entry = min(br["o"], br["c"])
         stop = br["l"]
         risk = entry - stop
         if risk <= 0 or cur["l"] > entry:
             return None
-        return {"symbol": symbol, "side": "long", "entry": entry, "stop": stop, "take": entry + risk, "u": 0.0}
+        return {"side": "long", "entry": entry, "stop": stop, "take": entry + risk, "u": 0.0}
     return None
+
+def signal(symbol: str) -> dict | None:
+    cs = candles.get(symbol) or []
+    if symbol in positions or day_pnl <= DAILY_STOP:
+        return None
+    sig = setup(cs)  # только закрытые свечи: cur = последняя закрытая
+    if sig:
+        sig["symbol"] = symbol
+    return sig
 
 
 def refresh() -> None:
@@ -193,7 +228,7 @@ def snapshot() -> dict:
             "updated": updated,
             "open": list(positions.values()),
             "closed": closed[:12],
-            "note": "paper only",
+            "note": "grail Musa, no gamma, paper only",
         }
 
 
@@ -209,7 +244,7 @@ def loop() -> None:
 PAGE = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Paper Graal NQ GC</title>
+<title>Grail paper</title>
 <style>
 body{margin:0;font-family:-apple-system,sans-serif;background:#101010;color:#f3f3f3}
 main{max-width:760px;margin:0 auto;padding:18px 14px 40px}
@@ -218,8 +253,8 @@ main{max-width:760px;margin:0 auto;padding:18px 14px 40px}
 .card{background:#1b1b1b;border-radius:14px;padding:12px;margin:8px 0}
 .row{display:flex;justify-content:space-between;margin-top:4px;color:#ccc}
 </style></head><body><main>
-<h1>Paper Graal</h1>
-<p class="muted">Полка, имбаланс, пробой, вход на тень, стоп за тенью, тейк 1:1. Риск $200. Не как на видео.</p>
+<h1>Грааль paper</h1>
+<p class="muted">Бокс, пустота слева, пробой телом, ретест, стоп за фитиль, тейк 1:1. Азия скип. Гаммы нет. Риск $200.</p>
 <div class="grid">
 <div class="card">депозит<b id="eq">—</b></div>
 <div class="card">pnl<b id="pnl">—</b></div>
@@ -243,7 +278,7 @@ async function refresh(){
      <div class="row"><span>сейчас</span><span>${(x.price ?? x.entry).toFixed(2)}</span></div>
      <div class="row"><span>вход</span><span>${x.entry.toFixed(2)}</span></div>
      <div class="row"><span>стоп</span><span>${x.stop.toFixed(2)}</span></div>
-     <div class="row"><span>тейк 1:1</span><span>${x.take.toFixed(2)}</span></div></div>`).join('') || '<div class="card">скип</div>';
+     <div class="row"><span>тейк 1:1</span><span>${x.take.toFixed(2)}</span></div></div>`).join('') || '<div class="card">скип, нет бокса или ретеста</div>';
   document.getElementById('hist').innerHTML = s.closed.map(x =>
     `<div class="card"><div class="row"><span>${x.symbol} ${x.side} ${x.why}</span><b class="${x.pnl>=0?'up':'down'}">${x.pnl.toFixed(2)}</b></div></div>`).join('');
 }
