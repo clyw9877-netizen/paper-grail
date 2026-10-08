@@ -138,7 +138,6 @@ def refresh() -> None:
                 hit_stop = last["l"] <= p["stop"] if p["side"] == "long" else last["h"] >= p["stop"]
                 hit_take = last["h"] >= p["take"] if p["side"] == "long" else last["l"] <= p["take"]
                 direction = 1 if p["side"] == "long" else -1
-                p["u"] = (last["c"] - p["entry"]) / abs(p["entry"] - p["stop"]) * RISK_USD * direction
                 if hit_stop or hit_take:
                     pnl = (RISK_USD if hit_take else -RISK_USD) - COMMISSION
                     equity += pnl
